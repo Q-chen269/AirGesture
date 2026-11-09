@@ -51,9 +51,11 @@ class AirGestureService : LifecycleService() {
         hud = HudOverlay(this).also { it.show() }
     }
 
-    override fun onStart() {
-        super.onStart()
+    // Service 没有 onStart()，生命周期入口是 onStartCommand
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        super.onStartCommand(intent, flags, startId)
         if (!bound) startCamera()
+        return START_STICKY
     }
 
     override fun onDestroy() {
