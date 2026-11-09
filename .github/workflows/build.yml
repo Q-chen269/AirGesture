@@ -21,6 +21,12 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          # 关键：默认的 "tools" 包已被 Google 从 SDK 仓库移除，会导致 sdkmanager 退出码 1
+          packages: 'platform-tools platforms;android-34 build-tools;34.0.0'
+
+      - name: Accept Android licenses
+        run: yes | sdkmanager --licenses > /dev/null 2>&1 || true
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
