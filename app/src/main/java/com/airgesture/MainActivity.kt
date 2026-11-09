@@ -97,7 +97,7 @@ class MainActivity : AppCompatActivity() {
     private fun addButton(root: LinearLayout, label: String, onClick: () -> Unit) {
         val button = Button(this).apply {
             text = label
-            isAllCaps = false
+            setAllCaps(false)
             setOnClickListener { onClick() }
         }
         root.addView(
