@@ -1,0 +1,12 @@
+*.iml
+.gradle/
+local.properties
+.idea/
+build/
+captures/
+.externalNativeBuild/
+.cxx/
+.DS_Store
+
+# 模型文件不入库，由 CI 下载（本地编译见 README）
+app/src/main/assets/hand_landmarker.task

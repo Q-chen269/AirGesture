@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">隔空手势</string>
+    <string name="accessibility_desc">把隔空手势转换为屏幕上的滑动与点击</string>
+</resources>
