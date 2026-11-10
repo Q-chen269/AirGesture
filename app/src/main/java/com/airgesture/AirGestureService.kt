@@ -57,6 +57,9 @@ class AirGestureService : LifecycleService() {
 
     private var bound = false
     private var lastDetectAt = 0L
+    private var lastErrorAt = 0L
+    private var frameCount = 0L
+    private var detectionCount = 0L
 
     private var mode = Prefs.MODE_PAGING
     private var hasPose = false
@@ -143,6 +146,7 @@ class AirGestureService : LifecycleService() {
                 tracker?.close()
                 tracker = HandTracker(
                     context = this,
+                    preferGpu = false,
                     onHand = { x, y, pinch, edge -> onHand(x, y, pinch, edge) },
                     onIdle = { onIdle() }
                 )
@@ -150,7 +154,7 @@ class AirGestureService : LifecycleService() {
                 val useCase = ImageAnalysis.Builder()
                     .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                     .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
-                    .setTargetResolution(Size(480, 360))
+                    .setTargetResolution(Size(480, 640))
                     .build()
 
                 useCase.setAnalyzer(analyzerExecutor) { proxy -> analyzeFrame(proxy) }
@@ -158,7 +162,7 @@ class AirGestureService : LifecycleService() {
                 provider.unbindAll()
                 provider.bindToLifecycle(this, CameraSelector.DEFAULT_FRONT_CAMERA, useCase)
                 bound = true
-                hud?.setStatus("已启动，把手放进画面")
+                hud?.setStatus("已启动（${tracker?.delegateName}），把手放进画面")
             } catch (e: Exception) {
                 hud?.setStatus("启动失败：${e.message}")
             }
@@ -172,15 +176,21 @@ class AirGestureService : LifecycleService() {
             if (now - lastDetectAt < FRAME_INTERVAL_MS) return
             if (powerManager?.isInteractive == false) return
             lastDetectAt = now
+            frameCount++
             tracker?.detect(proxy.toBitmapRotated(), now)
-        } catch (_: Exception) {
-            // 单帧失败跳过
+        } catch (e: Exception) {
+            val now = SystemClock.uptimeMillis()
+            if (now - lastErrorAt > 3000) {
+                lastErrorAt = now
+                hud?.setStatus("取帧失败：${e.javaClass.simpleName}")
+            }
         } finally {
             proxy.close()
         }
     }
 
     private fun onHand(x: Float, y: Float, pinch: Float, nearEdge: Boolean) {
+        detectionCount++
         // 贴边 = 手要走/刚走，不做任何动作
         if (nearEdge) {
             recognizer.onHandLost()
@@ -238,7 +248,7 @@ class AirGestureService : LifecycleService() {
     private fun onIdle() {
         recognizer.onHandLost()
         hasPose = false
-        hud?.setStatus("未检测到手")
+        hud?.setStatus("未检测到手（帧$frameCount/手$detectionCount）")
     }
 
     private fun updateCursor() {
@@ -250,15 +260,29 @@ class AirGestureService : LifecycleService() {
     }
 
     private fun ImageProxy.toBitmapRotated(): Bitmap {
-        val buffer = planes[0].buffer
+        val plane = planes[0]
+        val buffer = plane.buffer
         buffer.rewind()
-        val raw = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+
+        val pixelStride = plane.pixelStride
+        val rowStride = plane.rowStride
+        // 有些机型 buffer 每行尾部有对齐填充，直接拷会花屏/越界，这里按真实行宽处理
+        val rowPadding = rowStride - pixelStride * width
+        val paddedWidth = width + rowPadding / pixelStride
+
+        val raw = Bitmap.createBitmap(paddedWidth, height, Bitmap.Config.ARGB_8888)
         raw.copyPixelsFromBuffer(buffer)
 
+        val cropped = if (paddedWidth != width) {
+            Bitmap.createBitmap(raw, 0, 0, width, height)
+        } else {
+            raw
+        }
+
         val degrees = imageInfo.rotationDegrees
-        if (degrees == 0) return raw
+        if (degrees == 0) return cropped
         val matrix = Matrix().apply { postRotate(degrees.toFloat()) }
-        return Bitmap.createBitmap(raw, 0, 0, raw.width, raw.height, matrix, true)
+        return Bitmap.createBitmap(cropped, 0, 0, cropped.width, cropped.height, matrix, true)
     }
 
     private fun buildNotification(): Notification {

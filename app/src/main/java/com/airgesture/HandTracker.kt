@@ -13,19 +13,34 @@ import kotlin.math.hypot
 /**
  * MediaPipe HandLandmarker 封装。
  *
- * 输出：
- *  - x/y      食指指尖(8)的归一化坐标（0~1）
- *  - pinch    拇指尖(4)与食指尖(8)距离 / 手掌尺寸（与远近无关，>0.8 张开，<0.38 捏合）
- *  - nearEdge 指尖是否贴边（准备离开/刚离开画面）
+ * 默认走 CPU：GPU delegate 在部分机型上会"创建成功但不返回结果"，
+ * 表现为完全检测不到手，所以默认关闭，需要时再打开。
  */
 class HandTracker(
     private val context: Context,
+    private val preferGpu: Boolean = false,
     private val onHand: (x: Float, y: Float, pinch: Float, nearEdge: Boolean) -> Unit,
     private val onIdle: () -> Unit
 ) {
 
-    private val landmarker: HandLandmarker =
-        runCatching { create(Delegate.GPU) }.getOrElse { create(Delegate.CPU) }
+    private val landmarker: HandLandmarker
+    val delegateName: String
+
+    init {
+        if (preferGpu) {
+            val gpu = runCatching { create(Delegate.GPU) }.getOrNull()
+            if (gpu != null) {
+                landmarker = gpu
+                delegateName = "GPU"
+            } else {
+                landmarker = create(Delegate.CPU)
+                delegateName = "CPU"
+            }
+        } else {
+            landmarker = create(Delegate.CPU)
+            delegateName = "CPU"
+        }
+    }
 
     private fun create(delegate: Delegate): HandLandmarker {
         val base = BaseOptions.builder()
@@ -37,9 +52,9 @@ class HandTracker(
             .setBaseOptions(base)
             .setRunningMode(RunningMode.LIVE_STREAM)
             .setNumHands(1)
-            .setMinHandDetectionConfidence(0.5f)
-            .setMinHandPresenceConfidence(0.5f)
-            .setMinTrackingConfidence(0.5f)
+            .setMinHandDetectionConfidence(0.35f)
+            .setMinHandPresenceConfidence(0.35f)
+            .setMinTrackingConfidence(0.35f)
             .setResultListener { result, _ -> handle(result) }
             .setErrorListener { _ -> }
             .build()
@@ -67,13 +82,13 @@ class HandTracker(
         val wrist = hand[0]
         val mcp = hand[9]
 
-        // 用手掌尺寸做归一化，避免手离镜头远近导致阈值失效
         val palm = hypot(wrist.x() - mcp.x(), wrist.y() - mcp.y()).coerceAtLeast(1e-4f)
         val pinch = hypot(thumb.x() - tip.x(), thumb.y() - tip.y()) / palm
 
         val x = tip.x()
         val y = tip.y()
-        val nearEdge = x < 0.07f || x > 0.93f || y < 0.08f || y > 0.92f
+        // 贴边判定放宽到 5%/6%，避免手在画面偏上/偏下就完全没反应
+        val nearEdge = x < 0.05f || x > 0.95f || y < 0.06f || y > 0.94f
 
         onHand(x, y, pinch, nearEdge)
     }
