@@ -1,109 +1,111 @@
-# 隔空手势 · 翻页版（AirGesture）
+# 隔空手势 AirGesture
 
-用**前置摄像头**识别手部动作，通过**无障碍服务**把动作变成真实滑动/点击。
-不用碰屏幕，就能刷短视频、翻阅读页。
+用**前置摄像头**识别手部，通过**无障碍服务**把动作变成真实的屏幕操作。
+不碰屏幕就能翻视频、点页面。
 
-## 手势映射
+## 两种模式（App 内可切换，切换后立即生效）
 
+### 翻页模式
 | 手势 | 动作 |
 |---|---|
-| 手上移（上滑） | 向下滑动页面 → 下一个视频 / 下一页 |
-| 手下移（下滑） | 向上滑动页面 → 上一个视频 / 上一页 |
-| 拇指 + 食指捏合 | 点击屏幕中心（播放/暂停） |
+| 手/食指向上移动 | 向下滚动 → 下一个视频 |
+| 手/食指向下移动 | 向上滚动 → 上一个视频 |
+| 捏合（可选） | 点击屏幕中心 |
 
-识别效果最好的条件：光线充足、手离镜头 **30~80cm**、手掌正对镜头、背景不要太乱。
+### 鼠标模式
+| 手势 | 动作 |
+|---|---|
+| 移动手 | 屏幕上的绿色圆点光标跟着动 |
+| 捏合一下 | 在光标位置点击 |
 
-## 技术栈
+## 防误触设计
 
-- Kotlin + CameraX（前置摄像头取流）
-- MediaPipe **HandLandmarker**（21 个手部关键点，端侧推理，不上传画面）
-- AccessibilityService + `dispatchGesture`（注入滑动/点击）
-- 前台服务 + 悬浮状态条
+- **进入预热**：手刚被识别到的前几帧不响应，避免"出现的一瞬间"误触发
+- **贴边不响应**：指尖进入画面边缘 7%/8% 区域（即将离开或刚离开）时，一律不做动作
+- **捏合严格化**：必须「先张开 → 再捏住 → 保持约 0.32 秒且不移动」才算点击，移动中捏合直接作废
+- **滑动需单调**：中途反向超过 45% 直接作废，必须一次性完成
+- **动作冷却**：两次动作间隔至少 0.9 秒
+- **点击可关闭**：App 里可一键关掉「捏合点击」，只保留滑动
+
+## 降耗措施
+
+- 推理限帧：约 11 fps（不是每帧都跑模型）
+- 优先 **GPU delegate**，不支持时自动回落 CPU
+- 采集分辨率 480×360
+- **熄屏时跳过推理**
 
 ## 目录结构
 
 ```
 AirGesture/
-├── .github/workflows/build.yml        # 云编译出 APK
-├── app/src/main/
-│   ├── AndroidManifest.xml
-│   ├── res/
-│   │   ├── xml/accessibility_service_config.xml
-│   │   ├── values/strings.xml, themes.xml
-│   │   └── drawable/ic_app.xml
-│   └── java/com/airgesture/
-│       ├── MainActivity.kt             # 权限引导页
-│       ├── AirGestureService.kt        # 前台服务：相机 + 识别
-│       ├── HandTracker.kt              # MediaPipe 封装
-│       ├── SwipeRecognizer.kt          # 手势判定（纯逻辑）
-│       ├── GestureAccessibilityService.kt  # 注入手势
-│       └── HudOverlay.kt               # 顶部状态条
+├── .github/workflows/build.yml        # GitHub Actions 云编译
+├── app/src/main/java/com/airgesture/
+│   ├── MainActivity.kt                # 权限引导 + 模式/灵敏度/点击开关
+│   ├── AirGestureService.kt           # 前台服务：相机 + 调度 + 模式切换
+│   ├── HandTracker.kt                 # MediaPipe 21 点，输出指尖/捏合比/贴边
+│   ├── SwipeRecognizer.kt             # 手势状态机（纯逻辑）
+│   ├── GestureAccessibilityService.kt # 注入滑动/点击
+│   ├── CursorOverlay.kt               # 鼠标模式的绿色光标
+│   ├── HudOverlay.kt                  # 顶部状态条
+│   └── Prefs.kt                       # 设置存储
+└── app/src/main/res/...
 ```
 
-## 方式一：GitHub Actions 云编译（推荐，不用装 Android Studio）
+## 构建
 
-1. 在 GitHub 新建一个**空仓库**（Private 也可以）
-2. 把 `AirGesture` 目录里的所有文件推上去：
-   ```bash
-   cd AirGesture
-   git init
-   git add .
-   git commit -m "init"
-   git branch -M main
-   git remote add origin https://github.com/<你的用户名>/<仓库名>.git
-   git push -u origin main
-   ```
-3. 打开仓库 → **Actions** 标签 → 等 `Build APK` 跑完（约 3~6 分钟）
-4. 点进这次运行 → 页面底部 **Artifacts** → 下载 `AirGesture-debug.zip`
-5. 解压得到 `app-debug.apk`，传到手机安装
+### 方式一：GitHub Actions（推荐）
 
-> 模型文件（约 7MB）由 workflow 自动下载，不需要提交到仓库。
+push 到 `main` 即自动构建，产物在 Actions 运行页底部 **Artifacts**。
 
-## 方式二：本机 Android Studio
+模型文件（7.5MB）由 workflow 自动下载，不提交到仓库。
 
-1. 装 Android Studio（自带 JDK + SDK）
-2. 先从 [这里](https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task) 下载模型，放到：
-   `app/src/main/assets/hand_landmarker.task`
-3. Android Studio 打开 `AirGesture` 目录，等待 Gradle 同步
-4. Run 或 Build → Build APK(s)
+### 方式二：本地编译
 
-## 手机上的配置步骤
+需要 JDK 17 + Android SDK(platform 34 / build-tools 34) + Gradle 8.7。
 
-1. 安装后打开 App，按 ①②③④ 顺序点
-2. **① 相机权限**：允许
-3. **② 悬浮窗权限**：允许（用来显示顶部状态条，不给也能跑，只是没提示）
-4. **③ 无障碍**：跳到系统设置 → 已下载的应用 → **隔空手势** → 打开
-   - 小米/红米会提示风险，选「确定」
-   - **小米经常需要开关两次**，开完回来看是否还是开启状态
-5. **④ 启动**：回到 App 点一下，顶部出现「隔空手势：已启动」
-6. 打开抖音/小说/任意 App，把手举到前置摄像头前试手势
+```bash
+# 1. 放好模型
+mkdir -p app/src/main/assets
+curl -L -o app/src/main/assets/hand_landmarker.task \
+  https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task
 
-### 小米/红米必做的保活
+# 2. 指向本地 SDK
+echo "sdk.dir=/path/to/android/sdk" > local.properties
 
-- 设置 → 应用管理 → 隔空手势 → **自启动** 打开
-- 同页 → **省电策略 → 无限制**
-- 最近任务 → 给 App **上锁**
-- 失效时重新打开 App 点一次「启动」
+# 3. 编译
+gradle :app:assembleDebug
+# 产物：app/build/outputs/apk/debug/app-debug.apk
+```
 
-## 调参
+## 手机端配置
 
-所有阈值都在 `SwipeRecognizer.kt` 底部：
+1. ① 相机权限 → ② 悬浮窗 → ③ 无障碍（**小米要开关两次**）→ ④ 启动
+2. 保活：应用管理 → 隔空手势 → 自启动开、省电策略「无限制」、最近任务上锁
+3. 顶部状态条会实时显示：`✋ 已识别` / `↑ 下一个` / `手在画面边缘，暂停响应`
+
+## 调参位置
+
+`SwipeRecognizer.kt` 底部：
 
 ```kotlin
-const val SWIPE_THRESHOLD = 0.12f   // 变大 = 更难触发，变小 = 更灵敏
-const val PINCH_THRESHOLD = 0.06f   // 捏合判定距离
-const val COOLDOWN_MS = 700L        // 两次动作最小间隔
+const val SWIPE_DISTANCE = 0.13f   // 滑动距离阈值，越小越灵敏
+const val MIN_SPEED = 0.00045f     // 最小速度（归一化位移/ms）
+const val PINCH_OPEN = 0.80f       // 判定"手张开"
+const val PINCH_CLOSE = 0.38f      // 判定"捏合"
+const val TAP_HOLD_MS = 320L       // 捏住多久才算点击
+const val WARMUP_FRAMES = 4        // 手出现后预热帧数
 ```
 
-`HandTracker.kt` 里可以调检测置信度和手数量。
+`AirGestureService.kt` 顶部：
+
+```kotlin
+private const val FRAME_INTERVAL_MS = 90L   // 推理间隔，越大越省电
+private const val SMOOTH = 0.45f            // 坐标平滑，越小越稳但越迟钝
+```
 
 ## 已知限制
 
-- 相机常开，**耗电和发热明显**，建议只在需要时启动
-- 暗光环境识别率会明显下降
-- 手势是"整屏滑动"，不区分具体 App，所以任何 App 都会响应（包括桌面）
-- Android 不允许程序自动开无障碍，必须用户手动开一次
-
-## 许可证
-
-个人使用。请在遵守各 App 用户协议的前提下使用。
+- 相机常开，耗电发热仍明显高于普通 App
+- 暗光识别率下降
+- 手势作用于整个屏幕，不区分 App
+- Android 不允许程序自动开启无障碍，必须用户手动开一次

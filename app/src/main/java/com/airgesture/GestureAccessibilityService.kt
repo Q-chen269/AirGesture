@@ -36,7 +36,7 @@ class GestureAccessibilityService : AccessibilityService() {
         super.onDestroy()
     }
 
-    /** up = true 表示向上滑（下一页） */
+    /** up = true 表示向上滑（下一个） */
     fun verticalSwipe(up: Boolean) {
         main.post {
             val dm: DisplayMetrics = resources.displayMetrics
@@ -49,19 +49,30 @@ class GestureAccessibilityService : AccessibilityService() {
                 path.moveTo(x, dm.heightPixels * 0.35f)
                 path.lineTo(x, dm.heightPixels * 0.85f)
             }
-            val stroke = GestureDescription.StrokeDescription(path, 0L, 200L)
-            val gesture = GestureDescription.Builder().addStroke(stroke).build()
-            runCatching { dispatchGesture(gesture, null, null) }
+            dispatch(Path().apply { addPath(path) }, 200L)
         }
     }
 
     fun tapCenter() {
+        val dm: DisplayMetrics = resources.displayMetrics
+        tapAt(dm.widthPixels / 2f, dm.heightPixels / 2f)
+    }
+
+    /** 在屏幕绝对坐标处点一下（鼠标模式用） */
+    fun tapAt(x: Float, y: Float) {
         main.post {
-            val dm: DisplayMetrics = resources.displayMetrics
-            val path = Path().apply { moveTo(dm.widthPixels / 2f, dm.heightPixels / 2f) }
-            val stroke = GestureDescription.StrokeDescription(path, 0L, 50L)
+            val safeX = x.coerceIn(2f, resources.displayMetrics.widthPixels - 2f)
+            val safeY = y.coerceIn(2f, resources.displayMetrics.heightPixels - 2f)
+            val path = Path().apply { moveTo(safeX, safeY) }
+            dispatch(path, 50L)
+        }
+    }
+
+    private fun dispatch(path: Path, durationMs: Long) {
+        runCatching {
+            val stroke = GestureDescription.StrokeDescription(path, 0L, durationMs)
             val gesture = GestureDescription.Builder().addStroke(stroke).build()
-            runCatching { dispatchGesture(gesture, null, null) }
+            dispatchGesture(gesture, null, null)
         }
     }
 }

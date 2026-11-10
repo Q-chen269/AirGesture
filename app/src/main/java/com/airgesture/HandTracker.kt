@@ -11,20 +11,26 @@ import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarkerResult
 import kotlin.math.hypot
 
 /**
- * 包一层 MediaPipe HandLandmarker，输出手心中心点和「拇指-食指」距离。
+ * MediaPipe HandLandmarker 封装。
+ *
+ * 输出：
+ *  - x/y      食指指尖(8)的归一化坐标（0~1）
+ *  - pinch    拇指尖(4)与食指尖(8)距离 / 手掌尺寸（与远近无关，>0.8 张开，<0.38 捏合）
+ *  - nearEdge 指尖是否贴边（准备离开/刚离开画面）
  */
 class HandTracker(
-    context: Context,
-    private val onHand: (x: Float, y: Float, pinch: Float) -> Unit,
+    private val context: Context,
+    private val onHand: (x: Float, y: Float, pinch: Float, nearEdge: Boolean) -> Unit,
     private val onIdle: () -> Unit
 ) {
 
-    private val landmarker: HandLandmarker
+    private val landmarker: HandLandmarker =
+        runCatching { create(Delegate.GPU) }.getOrElse { create(Delegate.CPU) }
 
-    init {
+    private fun create(delegate: Delegate): HandLandmarker {
         val base = BaseOptions.builder()
             .setModelAssetPath(MODEL_ASSET)
-            .setDelegate(Delegate.CPU)
+            .setDelegate(delegate)
             .build()
 
         val options = HandLandmarker.HandLandmarkerOptions.builder()
@@ -38,7 +44,7 @@ class HandTracker(
             .setErrorListener { _ -> }
             .build()
 
-        landmarker = HandLandmarker.createFromOptions(context, options)
+        return HandLandmarker.createFromOptions(context, options)
     }
 
     fun detect(bitmap: Bitmap, timestampMs: Long) {
@@ -55,18 +61,21 @@ class HandTracker(
             onIdle()
             return
         }
-        // 0 = 手腕，9 = 中指根部；取中点当手心
+
+        val tip = hand[8]      // 食指尖
+        val thumb = hand[4]    // 拇指尖
         val wrist = hand[0]
         val mcp = hand[9]
-        val cx = (wrist.x() + mcp.x()) / 2f
-        val cy = (wrist.y() + mcp.y()) / 2f
 
-        // 4 = 拇指尖，8 = 食指尖
-        val thumb = hand[4]
-        val index = hand[8]
-        val pinch = hypot(thumb.x() - index.x(), thumb.y() - index.y())
+        // 用手掌尺寸做归一化，避免手离镜头远近导致阈值失效
+        val palm = hypot(wrist.x() - mcp.x(), wrist.y() - mcp.y()).coerceAtLeast(1e-4f)
+        val pinch = hypot(thumb.x() - tip.x(), thumb.y() - tip.y()) / palm
 
-        onHand(cx, cy, pinch)
+        val x = tip.x()
+        val y = tip.y()
+        val nearEdge = x < 0.07f || x > 0.93f || y < 0.08f || y > 0.92f
+
+        onHand(x, y, pinch, nearEdge)
     }
 
     private companion object {

@@ -6,10 +6,12 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.content.SharedPreferences
 import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
 import android.graphics.Matrix
 import android.os.Build
+import android.os.PowerManager
 import android.os.SystemClock
 import android.util.Size
 import androidx.camera.core.CameraSelector
@@ -22,14 +24,22 @@ import androidx.lifecycle.LifecycleService
 import java.util.concurrent.Executors
 
 /**
- * 前台服务：长期持有前置摄像头，逐帧交给 MediaPipe 识别，
- * 识别到手势后调用无障碍服务注入滑动/点击。
+ * 前台服务：长期持有前置摄像头，逐帧交给 MediaPipe 识别。
+ *
+ * 降耗措施：
+ *  - 限制推理帧率（约 11fps），不是每帧都跑模型
+ *  - 优先用 GPU delegate，失败回落 CPU
+ *  - 熄屏时直接跳过推理
+ *  - 采集分辨率 480x360
  */
 class AirGestureService : LifecycleService() {
 
     companion object {
         const val CHANNEL_ID = "air_gesture"
         const val NOTI_ID = 1001
+
+        private const val FRAME_INTERVAL_MS = 90L
+        private const val SMOOTH = 0.45f
 
         @Volatile
         var running: Boolean = false
@@ -42,16 +52,48 @@ class AirGestureService : LifecycleService() {
     private var cameraProvider: ProcessCameraProvider? = null
     private var tracker: HandTracker? = null
     private var hud: HudOverlay? = null
+    private var cursor: CursorOverlay? = null
+    private var powerManager: PowerManager? = null
+
     private var bound = false
+    private var lastDetectAt = 0L
+
+    private var mode = Prefs.MODE_PAGING
+    private var hasPose = false
+    private var smoothX = 0.5f
+    private var smoothY = 0.5f
+    private var cursorX = 0f
+    private var cursorY = 0f
+
+    private val prefListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+        val p = Prefs.get(this)
+        when (key) {
+            Prefs.KEY_MODE -> {
+                mode = p.getInt(Prefs.KEY_MODE, Prefs.MODE_PAGING)
+                applyMode()
+            }
+            Prefs.KEY_SENS -> recognizer.sensitivity = p.getFloat(Prefs.KEY_SENS, 1.0f)
+            Prefs.KEY_TAP -> recognizer.tapEnabled = p.getBoolean(Prefs.KEY_TAP, true)
+        }
+    }
 
     override fun onCreate() {
         super.onCreate()
         running = true
+        powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+
+        val p = Prefs.get(this)
+        mode = p.getInt(Prefs.KEY_MODE, Prefs.MODE_PAGING)
+        recognizer.sensitivity = p.getFloat(Prefs.KEY_SENS, 1.0f)
+        recognizer.tapEnabled = p.getBoolean(Prefs.KEY_TAP, true)
+
         startForegroundCompat()
         hud = HudOverlay(this).also { it.show() }
+        cursor = CursorOverlay(this)
+        applyMode()
+        p.registerOnSharedPreferenceChangeListener(prefListener)
     }
 
-    // Service 没有 onStart()，生命周期入口是 onStartCommand
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         super.onStartCommand(intent, flags, startId)
         if (!bound) startCamera()
@@ -61,11 +103,25 @@ class AirGestureService : LifecycleService() {
     override fun onDestroy() {
         running = false
         bound = false
+        runCatching { Prefs.get(this).unregisterOnSharedPreferenceChangeListener(prefListener) }
         runCatching { tracker?.close() }
         runCatching { cameraProvider?.unbindAll() }
         runCatching { hud?.hide() }
+        runCatching { cursor?.hide() }
         analyzerExecutor.shutdown()
         super.onDestroy()
+    }
+
+    private fun applyMode() {
+        if (mode == Prefs.MODE_POINTER) {
+            recognizer.swipeEnabled = false
+            cursor?.show()
+            hud?.setStatus("鼠标模式：移动手 = 光标，捏合 = 点击")
+        } else {
+            recognizer.swipeEnabled = true
+            cursor?.hide()
+            hud?.setStatus("翻页模式：手上移 = 下一个，下移 = 上一个")
+        }
     }
 
     private fun startForegroundCompat() {
@@ -87,22 +143,22 @@ class AirGestureService : LifecycleService() {
                 tracker?.close()
                 tracker = HandTracker(
                     context = this,
-                    onHand = { x, y, pinch -> onHand(x, y, pinch) },
-                    onIdle = { hud?.setStatus("隔空手势：未检测到手") }
+                    onHand = { x, y, pinch, edge -> onHand(x, y, pinch, edge) },
+                    onIdle = { onIdle() }
                 )
 
-                val analysis = ImageAnalysis.Builder()
+                val useCase = ImageAnalysis.Builder()
                     .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                     .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
-                    .setTargetResolution(Size(480, 640))
+                    .setTargetResolution(Size(480, 360))
                     .build()
 
-                analysis.setAnalyzer(analyzerExecutor) { proxy -> analyzeFrame(proxy) }
+                useCase.setAnalyzer(analyzerExecutor) { proxy -> analyzeFrame(proxy) }
 
                 provider.unbindAll()
-                provider.bindToLifecycle(this, CameraSelector.DEFAULT_FRONT_CAMERA, analysis)
+                provider.bindToLifecycle(this, CameraSelector.DEFAULT_FRONT_CAMERA, useCase)
                 bound = true
-                hud?.setStatus("隔空手势：已启动，把手举到镜头前")
+                hud?.setStatus("已启动，把手放进画面")
             } catch (e: Exception) {
                 hud?.setStatus("启动失败：${e.message}")
             }
@@ -111,39 +167,86 @@ class AirGestureService : LifecycleService() {
 
     private fun analyzeFrame(proxy: ImageProxy) {
         try {
-            tracker?.detect(proxy.toBitmapRotated(), SystemClock.uptimeMillis())
+            val now = SystemClock.uptimeMillis()
+            // 限帧 + 熄屏不推理，降发热
+            if (now - lastDetectAt < FRAME_INTERVAL_MS) return
+            if (powerManager?.isInteractive == false) return
+            lastDetectAt = now
+            tracker?.detect(proxy.toBitmapRotated(), now)
         } catch (_: Exception) {
-            // 单帧失败直接跳过
+            // 单帧失败跳过
         } finally {
             proxy.close()
         }
     }
 
-    private fun onHand(x: Float, y: Float, pinch: Float) {
-        val action = recognizer.feed(x, y, pinch, SystemClock.uptimeMillis())
-        if (action == null) {
-            hud?.setStatus("隔空手势：✋ 已识别")
+    private fun onHand(x: Float, y: Float, pinch: Float, nearEdge: Boolean) {
+        // 贴边 = 手要走/刚走，不做任何动作
+        if (nearEdge) {
+            recognizer.onHandLost()
+            hasPose = false
+            hud?.setStatus("手在画面边缘，暂停响应")
             return
         }
+
+        if (!hasPose) {
+            smoothX = x
+            smoothY = y
+            hasPose = true
+        } else {
+            smoothX += (x - smoothX) * SMOOTH
+            smoothY += (y - smoothY) * SMOOTH
+        }
+
+        if (mode == Prefs.MODE_POINTER) updateCursor()
+
+        val action = recognizer.feed(smoothX, smoothY, pinch, SystemClock.uptimeMillis())
+        if (action == null) {
+            hud?.setStatus(
+                if (mode == Prefs.MODE_POINTER) "鼠标模式 ✋" else "✋ 已识别"
+            )
+            return
+        }
+
         val service = GestureAccessibilityService.instance
         if (service == null) {
-            hud?.setStatus("请先在设置里开启无障碍服务")
+            hud?.setStatus("请先开启无障碍服务")
             return
         }
+
         when (action) {
             SwipeRecognizer.Action.NEXT -> {
                 service.verticalSwipe(up = true)
-                hud?.setStatus("↑ 下一页")
+                hud?.setStatus("↑ 下一个")
             }
             SwipeRecognizer.Action.PREV -> {
                 service.verticalSwipe(up = false)
-                hud?.setStatus("↓ 上一页")
+                hud?.setStatus("↓ 上一个")
             }
             SwipeRecognizer.Action.TAP -> {
-                service.tapCenter()
-                hud?.setStatus("● 点击")
+                if (mode == Prefs.MODE_POINTER) {
+                    service.tapAt(cursorX, cursorY)
+                    hud?.setStatus("● 点击")
+                } else {
+                    service.tapCenter()
+                    hud?.setStatus("● 点击")
+                }
             }
         }
+    }
+
+    private fun onIdle() {
+        recognizer.onHandLost()
+        hasPose = false
+        hud?.setStatus("未检测到手")
+    }
+
+    private fun updateCursor() {
+        val dm = resources.displayMetrics
+        // 前置摄像头左右是镜像的，x 取反才符合直觉
+        cursorX = (1f - smoothX) * dm.widthPixels
+        cursorY = smoothY * dm.heightPixels
+        cursor?.move(cursorX, cursorY)
     }
 
     private fun ImageProxy.toBitmapRotated(): Bitmap {
@@ -173,7 +276,7 @@ class AirGestureService : LifecycleService() {
         )
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("隔空手势运行中")
-            .setContentText("上滑=下一页 · 下滑=上一页 · 捏合=点击")
+            .setContentText("翻页：上下移动手 · 鼠标：移动手+捏合点击")
             .setSmallIcon(R.drawable.ic_app)
             .setOngoing(true)
             .setContentIntent(intent)
